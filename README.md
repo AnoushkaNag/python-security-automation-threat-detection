@@ -597,3 +597,43 @@ a Random Forest classifier plus an Isolation Forest anomaly detector, and
 produces **output** as evaluation metrics (accuracy, precision, recall,
 F1) that quantify how well each model distinguishes phishing from
 legitimate sites.
+
+## Task 5 — SOAR Workflow Integration
+
+This section is a design discussion: the repository does not connect to
+any commercial SOAR product, and no such integration exists in the code.
+It describes how the four scripts above could be wired into a SOAR
+(Security Orchestration, Automation, and Response) workflow.
+
+This repository's three capabilities map onto distinct SOAR workflow
+stages. `port_scanner.py` supports the investigation/data-collection
+stage, discovering open ports and service banners on a host under active
+review. `log_enricher.py` and `virustotal_check.py` support the
+enrichment stage: they extract and deduplicate public IPs from raw logs,
+then attach threat-intelligence context — geolocation, hosting/proxy
+flags, and VirusTotal vendor-detection counts. `ml_threat_detector.py`
+supports detection and classification, converting enriched observations
+into a malicious/benign signal.
+
+A realistic flow: a suspicious IP appears in firewall or authentication
+logs. `log_enricher.py` extracts and deduplicates it, then `ip-api.com`
+and VirusTotal enrich it with geolocation and reputation data. If the IP
+belongs to infrastructure the organization is authorized to inspect,
+`port_scanner.py` investigates which services it exposes. These enriched
+features feed `ml_threat_detector.py`, which outputs a
+malicious-confidence score that the SOAR platform uses to decide the
+next action.
+
+I propose three thresholds. At or above 0.90 confidence, the SOAR
+platform automatically blocks the IP at the firewall, since the evidence
+justifies the risk of automation. Between 0.60 and 0.89, it opens a case
+and escalates to a human SOC analyst, since the evidence is suggestive
+but not conclusive. Below 0.60, it simply logs the event for future
+correlation.
+
+This threshold balances two failure modes. A false positive at high
+confidence could block a legitimate partner, customer, or business
+service, so full automation stays reserved for very strong evidence. A
+false negative left uninvestigated lets a genuine attacker continue
+operating, so mid-confidence cases still reach an analyst instead of
+being silently dropped.
