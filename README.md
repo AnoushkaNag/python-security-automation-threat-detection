@@ -217,3 +217,214 @@ correctly excluded from the table, and the duplicated `8.8.8.8` was
 enriched only once — confirming regex extraction, validation, private-IP
 filtering, deduplication, and live API enrichment all worked as
 required.
+
+## Task 3 — Machine-Learning Threat Detector
+
+### Dataset
+
+- **Name:** Phishing Websites
+- **Source:** UCI Machine Learning Repository, dataset id 327 —
+  <https://archive.ics.uci.edu/dataset/327/phishing+websites>
+- **Citation:** Mohammad, R., Thabtah, F., & McCluskey, L. (2015).
+  Phishing Websites [Dataset]. UCI Machine Learning Repository.
+  https://doi.org/10.24432/C51W2X
+- **Size:** 11,055 rows (samples) × 31 columns (30 features + 1 target
+  label) before preprocessing.
+- **Features:** 30 lexical, host-based, and HTML/JavaScript-based
+  indicators extracted from a URL/website (e.g. `having_ip_address`,
+  `url_length`, `sslfinal_state`, `age_of_domain`, `web_traffic`), each
+  discretized by the original authors into `{-1, 0, 1}`.
+- **Label:** `result` — the dataset's original UCI terminology and label
+  mapping is preserved: `-1` = phishing website, `1` = legitimate
+  website.
+
+### Retrieval / reproducibility
+
+The dataset is **not committed** to this repository (it's fetched live
+from UCI and is listed in `.gitignore` under `data/`). To reproduce:
+
+```
+pip install -r requirements.txt
+python download_dataset.py       # fetches & caches data/phishing_websites.csv
+python ml_threat_detector.py     # runs the full pipeline end-to-end
+```
+
+`ml_threat_detector.py` will also auto-download the dataset via
+`download_dataset.py` on first run if `data/phishing_websites.csv` is not
+already present, so `python ml_threat_detector.py` alone is sufficient.
+`download_dataset.py` uses the official `ucimlrepo` client library
+(`fetch_ucirepo(id=327)`) to pull the dataset directly from UCI.
+
+### First five rows (actual output)
+
+```
+--- First 5 rows ---
+   having_ip_address  url_length  ...  statistical_report  result
+0                 -1           1  ...                  -1      -1
+1                  1           1  ...                   1      -1
+2                  1           0  ...                  -1      -1
+3                  1           0  ...                   1      -1
+4                  1           0  ...                   1       1
+
+[5 rows x 31 columns]
+```
+
+(pandas truncates the middle columns of a 31-column frame by default when
+printing; this is the real `df.head()` output, not abbreviated by hand.)
+
+### Original class distribution
+
+```
+result
+ 1    6157
+-1    4898
+Name: count, dtype: int64
+```
+
+6,157 legitimate (`1`) vs. 4,898 phishing (`-1`) — a mild imbalance
+favoring the legitimate class.
+
+### Preprocessing
+
+Applied in this order, matching the assignment's required sequence:
+
+1. **Drop null rows** — `df.isnull().any(axis=1).sum()` was computed
+   first to report the count, then `df.dropna()` was applied.
+   **Null rows removed: 0** (the dataset has no missing values).
+2. **Encode categorical features** — the script checks for any
+   non-numeric (`object`-dtype) columns and label-encodes them if found.
+   This dataset's 30 features are already fully numeric (`-1`/`0`/`1`),
+   so **no categorical columns were found and no encoding was needed**.
+3. **Detect duplicate rows** — `df.duplicated().sum()` was computed
+   *before* dropping.
+   **Duplicate rows detected and removed: 5,206.**
+   This is a real, expected property of this dataset: because all 30
+   features take only 3 possible discrete values each, many of the
+   11,055 rows collide on the exact same 31-column combination (verified
+   independently: 5,270 rows are duplicates on the 30 feature columns
+   alone, ignoring the label — consistent with the 5,206 full-row
+   duplicates found once the label is included).
+4. **Drop duplicates** — `df.drop_duplicates()`, leaving **5,849 rows**.
+
+Post-preprocessing class distribution (5,849 rows): `-1` (phishing) =
+3,019, `1` (legitimate) = 2,830. Deduplication happened to remove
+disproportionately more legitimate-class rows, so **the minority class
+after preprocessing is legitimate (`1`)**, not phishing — the opposite of
+the raw, pre-dedup distribution above. This matters for Task 3, item 9
+(see Isolation Forest methodology below): the script determines the
+minority class programmatically from the actual post-preprocessing
+training labels (`y_train.value_counts().idxmin()`), rather than
+assuming which class is smaller.
+
+### Target/label column
+
+`result` (see Dataset section above for its `-1`/`1` mapping).
+
+### Train/test split
+
+`train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)` —
+an 80/20 split stratified on `result` to keep the same class ratio in
+both the training set (4,679 rows) and test set (1,170 rows), since the
+classes are not perfectly balanced.
+
+### Random Forest — configuration and results
+
+`RandomForestClassifier(random_state=42)` — **all hyperparameters left
+at scikit-learn defaults** (`n_estimators=100`, `criterion="gini"`,
+`max_depth=None`, etc.); `random_state=42` was set only for reproducible
+output, not as tuning.
+
+Precision/recall/F1 are reported with `pos_label=-1` (phishing treated as
+the positive/detected class, the natural framing for a security
+detector).
+
+Test-set results (actual run output):
+
+```
+Accuracy:  0.9419
+Precision: 0.9467
+Recall:    0.9404
+F1 score:  0.9435
+```
+
+Full `classification_report`:
+
+```
+               precision    recall  f1-score   support
+
+ phishing(-1)       0.95      0.94      0.94       604
+legitimate(1)       0.94      0.94      0.94       566
+
+     accuracy                           0.94      1170
+    macro avg       0.94      0.94      0.94      1170
+ weighted avg       0.94      0.94      0.94      1170
+```
+
+### Isolation Forest — methodology and results
+
+`IsolationForest(random_state=42)` (default `contamination="auto"`, all
+other hyperparameters at scikit-learn defaults) is fit **only on
+`X_train`'s features — it never sees `y_train`**. This is unsupervised
+anomaly detection, not a supervised classifier; the true labels are used
+afterward solely to *score* how well the anomalies it finds line up with
+reality, which does not make the model itself supervised.
+
+IsolationForest's raw `.predict()` output is `1` = inlier, `-1` =
+anomaly. Per the assignment, the **minority class is treated as the
+anomaly class**. The script computes this minority class directly from
+`y_train` (`y_train.value_counts().idxmin()`) rather than assuming it, so
+the mapping used for the actual run was:
+
+```
+Anomaly-label mapping (IsolationForest output -> class label): {-1: 1, 1: -1}
+```
+
+i.e. IsolationForest's `-1` (anomaly) → mapped to class label `1`
+(legitimate, the post-preprocessing minority class); IsolationForest's
+`1` (inlier) → mapped to class label `-1` (phishing, the majority class).
+Predictions are remapped with this dictionary and then compared directly
+against the real `result` values on the test set.
+
+**Anomaly detection accuracy: 0.5641**
+
+### Model comparison
+
+| Model | Accuracy | Precision | Recall | F1 Score | Notes |
+|---|---|---|---|---|---|
+| Random Forest | 0.9419 | 0.9467 | 0.9404 | 0.9435 | Supervised classifier; default hyperparameters; positive class = phishing (`-1`) |
+| Isolation Forest | 0.5641 | N/A | N/A | N/A | Unsupervised anomaly detector; accuracy computed via the explicit minority-class-as-anomaly mapping above. Precision/Recall/F1 are reported as N/A because Task 3 item 9 only requires anomaly-detection accuracy for this model — IsolationForest's `-1`/`1` output is a contamination-driven anomaly flag, not a calibrated classifier decision, so per-class precision/recall figures for it would not be directly comparable to the Random Forest's and are outside the assignment's required scope for this model |
+
+### Discussion (196 words)
+
+Raw accuracy is a poor headline metric for imbalanced security data
+because a model can score deceptively high just by favoring the majority
+class — on our test set, always predicting the majority class alone
+would already score about 52% accuracy without catching a single real
+threat correctly. Precision answers "of the alerts flagged as phishing,
+how many were actually phishing?", which controls false-positive alert
+fatigue for analysts; recall answers "of the real phishing sites, how
+many did we catch?", which controls missed threats. F1 is the harmonic
+mean of precision and recall, so it only stays high when both are
+reasonably high, penalizing models that inflate one at the other's
+expense — our Random Forest's F1 of 0.94 shows it is catching most
+phishing sites without flooding analysts with false alarms. In a real
+SOC, Random Forest's limitation is that it can only recognize attack
+patterns resembling its labeled training data, leaving it blind to
+genuinely novel phishing techniques. Isolation Forest's limitation is the
+opposite: with no concept of "phishing" at all, it just flags
+statistically unusual feature combinations, including benign-but-rare
+sites, which is why its accuracy here (56%) is far below the supervised
+model's.
+
+### Reproducibility instructions
+
+```
+pip install -r requirements.txt
+python download_dataset.py
+python ml_threat_detector.py
+```
+
+Both scripts were verified with `python -m py_compile download_dataset.py
+ml_threat_detector.py` before the run, and the pipeline above was
+executed end-to-end (fresh download included) to produce every number in
+this section.
