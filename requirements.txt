@@ -2,3 +2,4 @@ requests
 pandas
 scikit-learn
 ucimlrepo
+python-dotenv

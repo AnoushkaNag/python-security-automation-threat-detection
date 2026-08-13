@@ -428,3 +428,172 @@ Both scripts were verified with `python -m py_compile download_dataset.py
 ml_threat_detector.py` before the run, and the pipeline above was
 executed end-to-end (fresh download included) to produce every number in
 this section.
+
+## Task 4 — VirusTotal REST API Enrichment
+
+### What it does
+
+`virustotal_check.py` reads a plain-text log file, reuses Task 2's
+`extract_public_ips()` from `log_enricher.py` to pull out unique,
+validated, non-private IPv4 addresses (instead of duplicating that
+regex/filtering logic), and queries the **VirusTotal public API v3** IP
+reputation endpoint for each one, conceptually:
+
+```
+GET https://www.virustotal.com/api/v3/ip_addresses/<ip>
+```
+
+For each IP it extracts `last_analysis_stats.malicious`,
+`last_analysis_stats.harmless`, and `last_analysis_date` from the JSON
+response, converts the Unix timestamp to a human-readable UTC string,
+and builds a result dictionary such as:
+
+```python
+{
+    "8.8.8.8": {
+        "malicious": 0,
+        "harmless": 90,
+        "last_analysis_date": "2026-08-13 12:00:00 UTC"
+    }
+}
+```
+
+Task 2 (`log_enricher.py`, its ip-api.com enrichment, and `sample.log`)
+was left completely untouched -- this is a separate script (Option B)
+that only imports one existing function from it.
+
+### API key handling
+
+- The key is loaded **only** from the `VT_API_KEY` environment variable,
+  via `get_api_key()` in `virustotal_check.py`. It is never hardcoded
+  anywhere in the source.
+- `python-dotenv`'s `load_dotenv()` is called first, so a local `.env`
+  file (not committed) can set `VT_API_KEY` the same way a real shell
+  environment variable would.
+- The key is sent to VirusTotal using the correct v3 header:
+  `headers = {"x-apikey": api_key}`.
+- The key is never printed, logged, or included in any script output.
+
+`.env.example` (placeholder only, not a real key):
+
+```
+VT_API_KEY=your_virustotal_api_key_here
+```
+
+`.gitignore` was updated to add `.env` (existing rules were preserved,
+not removed):
+
+```
+__pycache__/
+*.pyc
+data/
+.env
+```
+
+### Usage
+
+```
+pip install -r requirements.txt
+# create a local .env with your own key (never commit this file):
+#   VT_API_KEY=<your real key>
+python virustotal_check.py sample.log
+```
+
+### Error handling
+
+`query_virustotal()` wraps every network/parsing step in `try/except`
+and returns a `{"error": ..., "message": ...}` dict instead of raising,
+so one bad IP/response never stops the rest of the batch:
+
+| Condition | Handling |
+|---|---|
+| `VT_API_KEY` missing | Detected before any request is made; prints one clear warning, IP is reported with `error: missing_api_key` |
+| HTTP 401 (invalid key) | Caught via status-code check; `error: invalid_api_key` |
+| HTTP 429 (rate limited) | Caught via status-code check; `error: rate_limited` |
+| HTTP 404 (not found) | Caught via status-code check; `error: not_found` |
+| Network error (timeout, DNS, connection refused) | Caught via `requests.exceptions.RequestException`; `error: network_error` |
+| Malformed JSON | Caught via `response.json()` raising `ValueError`; `error: invalid_json` |
+| Missing/unexpected fields | Caught via `KeyError`/`TypeError` when reading `last_analysis_stats`; `error: unexpected_schema` |
+
+### Testing performed
+
+No real VirusTotal API key was available in this environment
+(`VT_API_KEY` was unset), so testing covered two tracks:
+
+**1. Real, unmocked run — missing-key path.** Run against `sample.log`
+with no `VT_API_KEY` set at all (actual output, not fabricated):
+
+```
+VT_API_KEY is not set (checked the environment and a local .env file). VirusTotal lookups will be skipped for all IPs below.
+
+VirusTotal enrichment summary (3 public IP(s))
+IP              Malicious  Harmless  Last Analysis (UTC)   Notes
+----------------------------------------------------------------
+1.1.1.1         -          -         -                     VT_API_KEY is not set
+203.0.113.42    -          -         -                     VT_API_KEY is not set
+8.8.8.8         -          -         -                     VT_API_KEY is not set
+```
+
+Exit code `0`, no traceback -- confirms the missing-key path never
+crashes the script.
+
+**2. Mocked HTTP responses — every other error path plus success.**
+Using `unittest.mock.patch` on `virustotal_check.requests.get` with a
+fake, non-functional placeholder key string (never a real key), each
+branch of `query_virustotal()` was exercised directly and asserted to
+return the correct `error` key (or a clean success dict) without
+raising:
+
+- successful 200 response → parsed correctly into
+  `{"malicious": 2, "harmless": 88, "last_analysis_date": "2025-08-12 12:00:00 UTC"}`
+- HTTP 401 → `error: invalid_api_key`
+- HTTP 429 → `error: rate_limited`
+- HTTP 404 → `error: not_found`
+- malformed (non-JSON) body → `error: invalid_json`
+- simulated `ConnectionError` → `error: network_error`
+- well-formed JSON missing `last_analysis_stats` → `error: unexpected_schema`
+
+All eight cases (including the missing-key case) passed. The mock test
+script was run for verification only and is not part of the committed
+deliverable.
+
+### Sample output (for at least two IPs)
+
+**Example mocked output** — live VirusTotal API access was not available
+(no `VT_API_KEY` configured in this environment), so the two rows below
+are illustrative values from the mocked-response test above and a
+second, manually-constructed mocked example, formatted exactly as
+`print_summary()` renders them. These are **not** real VirusTotal
+results:
+
+```
+Example mocked output
+VirusTotal enrichment summary (2 public IP(s))
+IP              Malicious  Harmless  Last Analysis (UTC)   Notes
+----------------------------------------------------------------
+8.8.8.8         2          88        2025-08-12 12:00:00 UTC
+1.1.1.1         0          91        2025-08-12 09:15:00 UTC
+```
+
+If you configure a real `VT_API_KEY` locally (via `.env`, never
+committed) and run `python virustotal_check.py sample.log`, this table
+will populate with genuine VirusTotal data instead.
+
+## Input → Process → Output
+
+Every script in this repository follows the same automation shape: take
+in raw, low-level data; run a defined, repeatable process over it; hand
+back a distilled, decision-ready result. `port_scanner.py` takes a
+**target IP and port range as input**, **processes** it by attempting a
+concurrent TCP connection to every port and grabbing any banner offered,
+and produces **output** as a table of open ports and services.
+`log_enricher.py` takes a **raw log file as input**, **processes** it by
+extracting, validating, and deduplicating public IPs before querying
+ip-api.com for each one, and produces **output** as a per-IP threat
+intelligence table (country, ISP, hosting/proxy/mobile flags).
+`ml_threat_detector.py` takes a **labeled phishing-website dataset as
+input**, **processes** it by cleaning/deduplicating the data and training
+a Random Forest classifier plus an Isolation Forest anomaly detector, and
+produces **output** as evaluation metrics (accuracy, precision, recall,
+F1) that quantify how well each model distinguishes phishing from
+legitimate sites.
